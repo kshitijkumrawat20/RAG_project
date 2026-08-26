@@ -1,0 +1,90 @@
+name: anythingllm-stack
+
+# AnythingLLM as a knowledge-base agent:
+#   generation  -> the EXISTING local LLM container (OpenAI-compatible, GPU, port 8000)
+#   embeddings  -> AnythingLLM's built-in `native` embedder, in-process, CPU only
+#   vector store-> LanceDB, embedded, persisted under ./data
+#
+# Nothing in this file contains a secret, a network name, or a vault host path — those all
+# come from .env (see .env.example).
+
+services:
+  anythingllm:
+    image: mintplexlabs/anythingllm:${ANYTHINGLLM_IMAGE_TAG:-latest}
+    container_name: anythingllm
+    restart: unless-stopped
+    # Required by the bundled document collector's headless Chromium (link scraping).
+    # Safe to remove if you only ever ingest files from the vault.
+    cap_add:
+      - SYS_ADMIN
+    environment:
+      # ---- core ----
+      SERVER_PORT: "3001"
+      STORAGE_DIR: /app/server/storage
+      DISABLE_TELEMETRY: ${DISABLE_TELEMETRY:-true}
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env - openssl rand -hex 32}
+      SIG_KEY: ${SIG_KEY:?set SIG_KEY in .env - openssl rand -hex 32}
+      SIG_SALT: ${SIG_SALT:?set SIG_SALT in .env - openssl rand -hex 32}
+      AUTH_TOKEN: ${AUTH_TOKEN:-}
+
+      # ---- generation: reuse the existing local LLM. No second generative model. ----
+      LLM_PROVIDER: generic-openai
+      GENERIC_OPEN_AI_BASE_PATH: ${LLM_BASE_PATH}
+      GENERIC_OPEN_AI_MODEL_PREF: ${LLM_MODEL}
+      GENERIC_OPEN_AI_API_KEY: ${LLM_API_KEY}
+      GENERIC_OPEN_AI_MODEL_TOKEN_LIMIT: ${LLM_MODEL_TOKEN_LIMIT:-8192}
+      GENERIC_OPEN_AI_MAX_TOKENS: ${LLM_MAX_TOKENS:-1024}
+
+      # ---- embeddings: separate, small, CPU-only. Never routed to the GPU endpoint. ----
+      EMBEDDING_ENGINE: ${EMBEDDING_ENGINE:-native}
+      EMBEDDING_MODEL_PREF: ${EMBEDDING_MODEL_PREF:-Xenova/all-MiniLM-L6-v2}
+      EMBEDDING_MODEL_MAX_CHUNK_LENGTH: ${EMBEDDING_MODEL_MAX_CHUNK_LENGTH:-1000}
+
+      # ---- chunking: mirrors the unstructured-stack's chunk sizing ----
+      TEXT_SPLITTER_CHUNK_SIZE: ${TEXT_SPLITTER_CHUNK_SIZE:-900}
+      TEXT_SPLITTER_CHUNK_OVERLAP: ${TEXT_SPLITTER_CHUNK_OVERLAP:-120}
+
+      # ---- vector store ----
+      VECTOR_DB: ${VECTOR_DB:-lancedb}
+
+      # ---- keep speech features local; no third-party calls with document content ----
+      WHISPER_PROVIDER: local
+      TTS_PROVIDER: native
+    ports:
+      - "${ANYTHINGLLM_BIND_ADDRESS:-127.0.0.1}:${ANYTHINGLLM_HOST_PORT:-3001}:3001"
+    volumes:
+      # Workspaces, SQLite, LanceDB vectors, cached embedding model.
+      - ./data:/app/server/storage
+      # Lets settings changed in the UI survive a container restart. Must already exist as
+      # a FILE before the first `up`, otherwise Docker creates a directory here.
+      - ./data/.env:/app/server/.env
+      # Vault access, deliberately scoped: only `corporate/` is mounted, read-only, since
+      # this container only reads preprocessed output. `shared/`, `tickets/`, `learnings/`
+      # and `skills/` are not visible to this container at all.
+      - ${VAULT_HOST_PATH}/corporate:/vault/corporate:ro
+    extra_hosts:
+      # Makes http://host.docker.internal:8000/v1 resolvable on Linux/WSL2 hosts too.
+      - "host.docker.internal:host-gateway"
+    networks:
+      - shared
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:3001/api/ping || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          # Embedding is the CPU-bound part of ingestion; more cores = faster ingest.
+          cpus: "${ANYTHINGLLM_CPU_LIMIT:-4}"
+          memory: ${ANYTHINGLLM_MEM_LIMIT:-8g}
+    # No `deploy.resources.reservations.devices` GPU block, on purpose. The embedder is a
+    # ~90MB MiniLM-class model that runs fine on CPU, and the RTX 5090's VRAM is fully
+    # committed to the existing LLM container. If you ever do want a GPU embedder, that is
+    # a separate opt-in service — do not attach a device to this container.
+
+networks:
+  shared:
+    external: true
+    name: ${SHARED_NETWORK_NAME}

@@ -1,0 +1,12 @@
+[project]
+name = "vault-preprocessor"
+version = "1.0.0"
+description = "Watches an inbox folder, partitions files via the self-hosted Unstructured API, and writes chunked Markdown + JSONL into /vault/corporate."
+requires-python = ">=3.11"
+dependencies = [
+  "requests>=2.32,<3",
+]
+
+# Dependencies are installed with uv (`uv pip install --system -r pyproject.toml`) in the
+# Dockerfile — no pip, no virtualenv inside the image. To produce a lockfile on the target
+# host: `uv lock` in this directory, then switch the Dockerfile to `uv sync --frozen`.

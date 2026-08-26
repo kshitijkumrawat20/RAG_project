@@ -1,0 +1,97 @@
+name: unstructured-stack
+
+# Two services:
+#   unstructured-api : the open-source, self-hosted Unstructured partitioning API (CPU only).
+#   preprocessor     : small worker that watches ./data/inbox, pushes files through the API,
+#                      and writes chunked Markdown + JSONL into /vault/corporate.
+#
+# The API alone is stateless request/response — it cannot land output in the vault, which is
+# the required handoff point to the AnythingLLM stack. The worker is what makes the handoff.
+
+services:
+  unstructured-api:
+    image: downloads.unstructured.io/unstructured-io/unstructured-api:${UNSTRUCTURED_API_IMAGE_TAG:-latest}
+    container_name: unstructured-api
+    restart: unless-stopped
+    environment:
+      PORT: "8000"
+      # CPU-only inference. Bound explicitly so hi_res OCR/layout cannot saturate the host
+      # while the GPU LLM container is serving.
+      OMP_NUM_THREADS: ${UNSTRUCTURED_OMP_NUM_THREADS:-4}
+      UNSTRUCTURED_PARALLEL_MODE_ENABLED: ${UNSTRUCTURED_PARALLEL_MODE_ENABLED:-false}
+    ports:
+      # NOTE: container port stays 8000, but the published host port must NOT be 8000 —
+      # that is already taken by the existing local LLM.
+      - "${UNSTRUCTURED_BIND_ADDRESS:-127.0.0.1}:${UNSTRUCTURED_HOST_PORT:-8003}:8000"
+    networks:
+      - shared
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python3 -c "import urllib.request as u; u.urlopen('http://localhost:8000/healthcheck')"
+          || curl -fsS http://localhost:8000/healthcheck
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 90s
+    deploy:
+      resources:
+        limits:
+          cpus: "${UNSTRUCTURED_API_CPU_LIMIT:-6}"
+          memory: ${UNSTRUCTURED_API_MEM_LIMIT:-8g}
+    # No GPU block by design: layout/OCR models here are small ONNX models that run on CPU,
+    # and the RTX 5090's VRAM is fully committed to the existing LLM container.
+
+  preprocessor:
+    build:
+      context: ./preprocessor
+      args:
+        UV_IMAGE_TAG: ${UV_IMAGE_TAG:-python3.12-bookworm-slim}
+    image: vault-preprocessor:${PREPROCESSOR_IMAGE_TAG:-1.0.0}
+    container_name: unstructured-preprocessor
+    restart: unless-stopped
+    depends_on:
+      unstructured-api:
+        condition: service_healthy
+    user: "${PREPROCESSOR_UID:-1000}:${PREPROCESSOR_GID:-1000}"
+    environment:
+      UNSTRUCTURED_API_URL: http://unstructured-api:8000
+      INBOX_DIR: /data/inbox
+      ARCHIVE_DIR: /data/archive
+      FAILED_DIR: /data/failed
+      STATE_DIR: /data/state
+      OUTPUT_DIR: /vault/corporate
+      WATCH_INTERVAL_SECONDS: ${WATCH_INTERVAL_SECONDS:-20}
+      ONE_SHOT: ${ONE_SHOT:-false}
+      ARCHIVE_PROCESSED: ${ARCHIVE_PROCESSED:-true}
+      REPROCESS_CHANGED: ${REPROCESS_CHANGED:-true}
+      PARTITION_STRATEGY: ${PARTITION_STRATEGY:-auto}
+      INFER_TABLE_STRUCTURE: ${INFER_TABLE_STRUCTURE:-false}
+      OCR_LANGUAGES: ${OCR_LANGUAGES:-eng}
+      CHUNKING_STRATEGY: ${CHUNKING_STRATEGY:-by_title}
+      CHUNK_MAX_CHARACTERS: ${CHUNK_MAX_CHARACTERS:-900}
+      CHUNK_NEW_AFTER_N_CHARS: ${CHUNK_NEW_AFTER_N_CHARS:-750}
+      CHUNK_OVERLAP: ${CHUNK_OVERLAP:-120}
+      CHUNK_COMBINE_UNDER_N_CHARS: ${CHUNK_COMBINE_UNDER_N_CHARS:-250}
+      REQUEST_TIMEOUT_SECONDS: ${REQUEST_TIMEOUT_SECONDS:-1800}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      # Stack-local persistent state: raw drop folder, archive, failures, processed-ledger.
+      - ./data:/data
+      # Vault access, deliberately scoped: only the `corporate/` subtree of the vault is
+      # mounted, and it lands at /vault/corporate inside the container. `shared/`,
+      # `tickets/`, `learnings/` and `skills/` are not visible to this container at all.
+      - ${VAULT_HOST_PATH}/corporate:/vault/corporate:rw
+    networks:
+      - shared
+    deploy:
+      resources:
+        limits:
+          cpus: "${PREPROCESSOR_CPU_LIMIT:-2}"
+          memory: ${PREPROCESSOR_MEM_LIMIT:-2g}
+
+networks:
+  shared:
+    external: true
+    name: ${SHARED_NETWORK_NAME}

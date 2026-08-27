@@ -5,9 +5,17 @@
 #   ./scripts/verify.sh "What is our travel expense policy?"
 #   STACK_ROOT=~ ./scripts/verify.sh          # stacks deployed under $HOME
 #
+# Execute it, do not `source` it — it cd's, sets shell options, and exits non-zero.
+#
 # STACK_ROOT is the directory containing unstructured-stack/ and anythingllm-stack/.
 # It defaults to this script's parent directory, then falls back to $HOME.
 # Exit code 0 means every check passed. Each failure is printed with the reason.
+
+if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
+  printf 'verify.sh must be executed, not sourced. Run:\n  bash %s\n' "${BASH_SOURCE[0]}" >&2
+  return 1 2>/dev/null || exit 1
+fi
+
 set -uo pipefail
 
 QUESTION="${1:-What documents are in this knowledge base?}"
@@ -34,11 +42,24 @@ fi
 cd "$STACK_ROOT" || exit 2
 printf 'stack root: %s\n' "$STACK_ROOT"
 
+# Parse a dotenv file instead of sourcing it: values legitimately contain spaces
+# (WORKSPACE_NAME), and sourcing would execute anything inside $( ) or backticks.
 load_env() {
-  local file="$1"
+  local file="$1" line key value
   [[ -f "$file" ]] || { bad "$file is missing (cp .env.example .env)"; return 1; }
-  set -a; # shellcheck disable=SC1090
-  source "$file"; set +a
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"                                  # tolerate CRLF
+    [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+    [[ "$line" == *=* ]] || continue
+    key="${line%%=*}"
+    value="${line#*=}"
+    key="${key//[[:space:]]/}"
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    if [[ ${#value} -ge 2 && ( "$value" == \"*\" || "$value" == \'*\' ) ]]; then
+      value="${value:1:${#value}-2}"                      # strip one quote pair
+    fi
+    export "$key=$value"
+  done < "$file"
   ok "loaded $file"
 }
 
@@ -161,7 +182,9 @@ if [[ "${doc_count:-0}" -gt 0 ]]; then
 else
   bad "no Markdown in $DOCS_DIR — drop a file in unstructured-stack/data/inbox and wait"
 fi
-if [[ "${chunk_count:-0}" -eq "${doc_count:-0}" && "${doc_count:-0}" -gt 0 ]]; then
+if [[ "${doc_count:-0}" -eq 0 ]]; then
+  bad "no chunk sidecars to compare yet (nothing has been preprocessed)"
+elif [[ "${chunk_count:-0}" -eq "${doc_count:-0}" ]]; then
   ok "$chunk_count chunk sidecar(s), one per document"
 else
   bad "chunk sidecars ($chunk_count) do not match documents ($doc_count)"

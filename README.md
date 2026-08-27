@@ -1,5 +1,9 @@
 # Document Preprocessing + Knowledge-Base Agent
 
+> **Just want to get it running?** → **[SETUP.md](SETUP.md)** is a step-by-step walkthrough
+> with copy-paste commands and a "check it worked" after every step. This README is the
+> reference: what each setting does, why it's set that way, and how to verify the whole thing.
+
 Two drop-in Docker Compose stacks for the self-hosted AI host:
 
 | Stack | Does | Talks to |
@@ -72,9 +76,13 @@ for v in JWT_SECRET SIG_KEY SIG_SALT; do echo "$v=$(openssl rand -hex 32)"; done
 `VAULT_HOST_PATH`.
 
 ```bash
-cd ~/unstructured-stack && cp .env.example .env && $EDITOR .env
-cd ~/anythingllm-stack  && cp .env.example .env && $EDITOR .env
+cd ~/unstructured-stack && cp .env.example .env && nano .env
+cd ~/anythingllm-stack  && cp .env.example .env && nano .env
 ```
+
+(Use whichever editor you have — `nano`, `vim`, or the file browser in your IDE. New to
+this? Follow [SETUP.md](SETUP.md) instead, which fills these in with copy-paste commands
+and no manual editing.)
 
 The only values you *must* change from the defaults:
 
@@ -231,7 +239,7 @@ precedence over the container's own `/app/server/.env`, so a provider change mad
 works until the next restart and then silently reverts. To change the model:
 
 ```bash
-$EDITOR ~/anythingllm-stack/.env      # LLM_MODEL=…
+nano ~/anythingllm-stack/.env      # change LLM_MODEL
 cd ~/anythingllm-stack && docker compose up -d
 ```
 

@@ -16,8 +16,9 @@
 #   6. generates JWT_SECRET / SIG_KEY / SIG_SALT    (skips any already set)
 #   7. creates the runtime folders both stacks need
 #   8. detects the local LLM on port 8000 and fills in its model id, if it is running
+#   9. checks that uv can actually build an environment for the helper scripts
 #
-# It does NOT start any container — Steps 2 and 4 of SETUP.md do that.
+# It does NOT start any container — section 1 of README.md walks through that.
 
 if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
   printf 'setup.sh must be executed, not sourced. Run:\n  bash %s\n' "${BASH_SOURCE[0]}" >&2
@@ -264,6 +265,30 @@ else
   skip "LLM_MODEL=$current_model (kept; port 8000 is not answering right now)"
 fi
 
+# --- 9. uv ---------------------------------------------------------------------------
+# `uv run scripts/allm.py ...` builds a throwaway environment from the script's inline
+# dependency block, so there is nothing to install by hand. On hosted dev boxes uv's cache
+# often lives inside the system Python prefix, and that is where this fails:
+#   failed to symlink ... /uv/venvs/<hash>/...: No such file or directory (os error 2)
+# Warn rather than fix: an export from this script cannot reach the caller's shell.
+step "uv (for the helper scripts)"
+if ! command -v uv >/dev/null 2>&1; then
+  warn "uv is not installed — scripts/allm.py needs it:"
+  printf '      curl -LsSf https://astral.sh/uv/install.sh | sh\n'
+else
+  uv_cache="$(uv cache dir 2>/dev/null | tail -1)"
+  if [[ -z "$uv_cache" ]]; then
+    skip "installed, but could not read its cache directory — carry on"
+  elif [[ "$uv_cache" == "$HOME"/* ]]; then
+    ok "cache is under your home directory ($uv_cache)"
+  else
+    warn "uv's cache is outside your home directory: $uv_cache"
+    printf '    That is what causes "failed to symlink ... uv/venvs/...". Run this, and add\n'
+    printf '    the same line to ~/.bashrc or ~/.zshrc so it sticks:\n'
+    printf '      export UV_CACHE_DIR="$HOME/.cache/uv"\n'
+  fi
+fi
+
 # --- summary -------------------------------------------------------------------------
 printf '\n\033[1mDone.\033[0m %d steps, %d warning(s).\n\n' "$STEPS" "$WARNS"
 printf 'Next, from %s:\n\n' "$REPO_ROOT"
@@ -279,4 +304,4 @@ printf '  5. uv run scripts/allm.py bootstrap\n'
 printf '     uv run scripts/allm.py ingest\n'
 printf '     uv run scripts/allm.py query "What is in this knowledge base?"\n'
 printf '  6. cd .. && bash scripts/verify.sh\n\n'
-printf 'Full explanations: SETUP.md\n'
+printf 'Full explanations, with a check after every step: README.md section 1.\n'

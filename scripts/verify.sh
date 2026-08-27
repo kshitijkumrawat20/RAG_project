@@ -199,7 +199,7 @@ if [[ -n "$sample" ]]; then
   fi
 fi
 
-head_ "8. Retrieval end-to-end"
+head_ "8. Retrieval and generation (checked separately, they fail independently)"
 if [[ -z "${ANYTHINGLLM_API_KEY:-}" ]]; then
   bad "ANYTHINGLLM_API_KEY unset — generate it in Settings > Tools > Developer API"
 else
@@ -208,21 +208,51 @@ else
   else
     bad "developer API key rejected"
   fi
-  body="$(QUESTION="$QUESTION" python3 -c \
-    'import json, os; print(json.dumps({"message": os.environ["QUESTION"], "mode": "query"}))')"
-  response="$(curl -fsS -X POST "${ALLM_URL}/api/v1/workspace/${SLUG}/chat" \
+
+  # 8a. Retrieval alone. No LLM is involved, so this must pass even on a host with no chat
+  # model — which is the whole reason it is separate from the chat check below.
+  search_body="$(QUESTION="$QUESTION" python3 -c \
+    'import json, os; print(json.dumps({"query": os.environ["QUESTION"], "topN": 6}))')"
+  search="$(curl -sS -X POST "${ALLM_URL}/api/v1/workspace/${SLUG}/vector-search" \
       -H "Authorization: Bearer ${ANYTHINGLLM_API_KEY}" \
       -H 'Content-Type: application/json' \
-      -d "$body" 2>/dev/null)"
+      -d "$search_body" 2>/dev/null)"
+  if [[ -z "$search" ]]; then
+    bad "vector-search request failed for slug '${SLUG}'"
+  elif grep -Eq '"results"[[:space:]]*:[[:space:]]*\[[[:space:]]*\]' <<<"$search"; then
+    bad "vector-search matched nothing — run allm.py ingest, or lower similarityThreshold"
+  elif grep -q '"results"' <<<"$search"; then
+    ok "vector-search returned matches — embedding and similarity search work"
+  else
+    bad "vector-search gave no results array: $(printf '%s' "$search" | head -c 200)"
+  fi
+
+  # 8b. The full round-trip, which needs the LLM. No -f here: AnythingLLM answers HTTP 500
+  # with a JSON body naming the failure, and -f would discard exactly that body.
+  chat_body="$(QUESTION="$QUESTION" python3 -c \
+    'import json, os; print(json.dumps({"message": os.environ["QUESTION"], "mode": "query"}))')"
+  response="$(curl -sS -X POST "${ALLM_URL}/api/v1/workspace/${SLUG}/chat" \
+      -H "Authorization: Bearer ${ANYTHINGLLM_API_KEY}" \
+      -H 'Content-Type: application/json' \
+      -d "$chat_body" 2>/dev/null)"
   if [[ -z "$response" ]]; then
     bad "workspace chat request failed for slug '${SLUG}'"
   else
     printf '  ---- response ----\n%s\n  ------------------\n' "$(printf '%s' "$response" | head -c 1200)"
-    if grep -q '"textResponse"' <<<"$response"; then ok "chat returned textResponse"; else bad "no textResponse in reply"; fi
-    if grep -q '"sources":\[\]' <<<"$response"; then
-      bad "sources[] is empty — retrieval matched nothing (ingest not run, or threshold too high)"
-    elif grep -q '"sources"' <<<"$response"; then
-      ok "sources[] is populated — retrieval works"
+    if grep -Eq '"error"[[:space:]]*:[[:space:]]*"' <<<"$response"; then
+      err_text="$(sed -n 's/.*"error"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' <<<"$response" | head -1)"
+      bad "chat aborted: ${err_text:-unknown} — generation only; 8a above is the retrieval verdict"
+    elif grep -Eq '"textResponse"[[:space:]]*:[[:space:]]*null' <<<"$response"; then
+      bad "textResponse is null — the LLM returned nothing. Check section 4 and LLM_MODEL"
+    elif grep -q '"textResponse"' <<<"$response"; then
+      ok "chat returned textResponse — generation works"
+      if grep -Eq '"sources"[[:space:]]*:[[:space:]]*\[[[:space:]]*\]' <<<"$response"; then
+        bad "but sources[] is empty — the answer was not grounded in the vault"
+      else
+        ok "sources[] is populated — the answer is grounded in retrieved chunks"
+      fi
+    else
+      bad "no textResponse in reply"
     fi
   fi
 fi

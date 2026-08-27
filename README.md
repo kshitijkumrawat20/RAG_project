@@ -38,7 +38,7 @@ anythingllm-stack/
   docker-compose.yml           anythingllm (single container)
   .env.example
   data/                        workspaces, SQLite, LanceDB vectors  (persistent)
-  scripts/allm.py              auth | set-key | bootstrap | ingest | query | docs | matrix
+  scripts/allm.py              auth | set-key | bootstrap | ingest | search | query | docs | matrix
   fixtures/                    sample files for the file-type matrix test
 scripts/setup.sh               one-shot setup: network, .env files, secrets, folders
 scripts/verify.sh              the verification checklist, automated
@@ -210,15 +210,26 @@ ingestion modes and what `bootstrap` sets.
 
 ### Step 7 — Ask it a question
 
+Two checks, because they fail independently. Retrieval first — this one needs no LLM:
+
+```bash
+cd anythingllm-stack && uv run scripts/allm.py search "What is in this knowledge base?" && cd ..
+```
+
+**Check:** one or more matches, each with a score and the `docSource` it came from. That
+proves the documents are embedded in LanceDB and the query vector matched them. Then the
+full round-trip, which does need the LLM:
+
 ```bash
 cd anythingllm-stack && uv run scripts/allm.py query "What is in this knowledge base?" && cd ..
 ```
 
-**Check:** you get an answer *and* a list of sources under it.
+**Check:** an answer *and* a list of sources under it.
 
-- Answer but no sources → retrieval matched nothing. Re-run `ingest`.
-- Sources but a connection error instead of an answer → the LLM on port 8000 is not
-  reachable. Retrieval is working; you just have no chat model on this machine.
+- `search` finds nothing → `ingest` never ran, or everything scored below the threshold.
+  Re-run with `--score-threshold 0.0` to see the raw ranking.
+- `search` works but `query` reports the chat model could not be reached → retrieval is
+  fine, there is just no LLM on this machine. See below.
 
 ### Step 8 — Run the full check
 
@@ -239,9 +250,14 @@ works except the final written answer:
 
 | Works | Does not work |
 | --- | --- |
-| Preprocessing (Steps 2–3) | Step 7's written answer |
+| Preprocessing (Steps 2–3) | Step 7's `query` — the written answer |
 | Upload, chunking, embedding (Step 6) | `verify.sh` section 4 |
-| Vector search — the `sources` list in Step 7 | `verify.sh` section 8's chat check |
+| Retrieval — Step 7's `search`, and `verify.sh` 8a | `verify.sh` 8b, the chat check |
+
+Use `search`, not `query`, to confirm retrieval here. When the provider is unreachable
+AnythingLLM aborts the chat *before* it populates `sources`, so `query` returns
+`sources: []` whether retrieval worked or not — the empty list is not a retrieval verdict.
+`search` goes straight to the vector store and answers the question on its own.
 
 So exactly two FAILs in `verify.sh` are expected on a host without an LLM, and are not a
 setup problem. On the real host, re-run `bash scripts/setup.sh` — it finds the LLM and fills
@@ -358,17 +374,26 @@ docker exec anythingllm curl -s http://host.docker.internal:8000/v1/models
 
 ## 4. Workspace, ingestion and querying
 
-The four helper commands, all run from `anythingllm-stack/`:
+The helper commands, all run from `anythingllm-stack/`:
 
 ```bash
-uv run scripts/allm.py auth                                    # key valid, endpoints reachable
-uv run scripts/allm.py bootstrap                               # create the workspace
-uv run scripts/allm.py ingest                                  # embed /vault/corporate/documents
+uv run scripts/allm.py auth                                     # key valid, endpoints reachable
+uv run scripts/allm.py bootstrap                                # create the workspace
+uv run scripts/allm.py ingest                                   # embed /vault/corporate/documents
+uv run scripts/allm.py search "travel expense policy"           # retrieval only, no LLM
 uv run scripts/allm.py query "What is our travel expense policy?"
 ```
 
 `uv run` resolves the script's inline dependencies into a throwaway environment each time —
 nothing to install, no venv to manage.
+
+`search` and `query` answer different questions and it is worth keeping them apart. `search`
+posts to `workspace/<slug>/vector-search` and returns the matching chunks with their scores,
+touching only the embedder and LanceDB. `query` posts to `workspace/<slug>/chat`, which does
+the same retrieval and then asks the LLM to write prose from it. So a failing `query` with a
+working `search` is a generation problem, and `query` alone cannot tell you that — it aborts
+with `sources: []` when the provider is down, which is indistinguishable from a retrieval
+miss.
 
 `ingest` is incremental: it keeps a sha256 ledger (`scripts/.ingest-ledger.json`), re-embeds
 only changed documents, and removes the superseded copies from the workspace. `--force`
@@ -546,10 +571,15 @@ It exits non-zero if any check fails. What it asserts:
 | 5 | Vault scoping: no `/vault` root mount, no non-corporate subfolder, `ls /vault` = `corporate` only, anythingllm mount is `ro` | pass |
 | 6 | No literal credentials in compose; network is `external: true` + `${SHARED_NETWORK_NAME}`; vault mount is `${VAULT_HOST_PATH}/corporate` | pass |
 | 7 | `corporate/documents/*.md` count > 0, one `.chunks.jsonl` per document, frontmatter + chunk markers present | pass |
-| 8 | Developer API key accepted; workspace chat returns `textResponse` **and a non-empty `sources[]`** | pass |
+| 8a | Developer API key accepted; `workspace/<slug>/vector-search` returns matches | pass — **no LLM needed** |
+| 8b | `workspace/<slug>/chat` returns a `textResponse` **and a non-empty `sources[]`** | pass — needs the LLM |
 
-Check 8 is the one that matters — a `textResponse` with `sources: []` means the stack is up
-but retrieval is not working.
+8a and 8b are separate because they fail for unrelated reasons. 8a is the retrieval verdict:
+it goes straight to the vector store, so it passes or fails on embedding and similarity
+search alone. 8b adds generation on top. On a host with no LLM, 8a passes and 8b fails —
+that is the expected result, not a broken knowledge base. The old single check could not tell
+those apart, because an aborted chat reports `sources: []` regardless of whether retrieval
+worked.
 
 Manual spot-checks worth doing once:
 
@@ -656,8 +686,10 @@ Runtime problems:
 | Preprocessor logs `permission denied` writing the vault | `PREPROCESSOR_UID`/`GID` do not own `$VAULT_HOST_PATH/corporate`. Re-run `setup.sh`, then `docker compose up -d` |
 | `port is already allocated` on 8000 | `UNSTRUCTURED_HOST_PORT` was set to 8000; the LLM owns it. Use 8003 |
 | PDF lands in `data/failed/` with "produced no text" | Scanned PDF. Set `PARTITION_STRATEGY=hi_res` (or `ocr_only`), `docker compose up -d`, move the file back into `data/inbox/` |
-| Chat answers but `sources: []` | Ingest never ran (`uv run scripts/allm.py ingest`), the wrong workspace slug, or `similarityThreshold` too high — try `--similarity-threshold 0.1` in `bootstrap` |
+| Chat answers but `sources: []` | Ingest never ran (`uv run scripts/allm.py ingest`), the wrong workspace slug, or `similarityThreshold` too high — try `--similarity-threshold 0.1` in `bootstrap`. Isolate it with `uv run scripts/allm.py search "<your query>"` |
+| Chat aborts with `Connection error.` and `sources: []` | Generation, not retrieval — AnythingLLM never got to fill in `sources`. Confirm retrieval with `search`, then fix `LLM_MODEL` / `LLM_BASE_PATH` |
 | Chat returns a provider/connection error | `LLM_MODEL` does not match a model id from `/v1/models`, or `host.docker.internal` is unreachable — test with `docker exec anythingllm curl -s $LLM_BASE_PATH/models`. If there is no LLM on this host at all, see the end of §1 |
+| `search` returns `404 vector-search` | Wrong workspace slug, or an AnythingLLM image predating the endpoint. Pin a newer `ANYTHINGLLM_IMAGE_TAG` |
 | Provider changes made in the UI revert after restart | Expected — compose env wins. Change `.env` and `docker compose up -d` (§3) |
 | Ingest re-uploads unchanged files | The ledger moved. It lives at `anythingllm-stack/scripts/.ingest-ledger.json`; point `--state-file` at it |
 | Embedding is slow | It is CPU-bound and intentionally so. Raise `ANYTHINGLLM_CPU_LIMIT`. Do not point embeddings at the GPU endpoint |

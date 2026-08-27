@@ -10,6 +10,7 @@ Run with uv — no venv to create, no pip:
     uv run scripts/allm.py auth
     uv run scripts/allm.py bootstrap
     uv run scripts/allm.py ingest
+    uv run scripts/allm.py search "travel expense policy"
     uv run scripts/allm.py query "What is our travel expense policy?"
     uv run scripts/allm.py docs
     uv run scripts/allm.py matrix --fixtures ./fixtures
@@ -441,16 +442,120 @@ def _payload_pieces(mode: str, title: str, body: str, meta: dict, rel: str) -> l
     ]
 
 
+def _score_text(value) -> str:
+    return f"{value:.4f}" if isinstance(value, (int, float)) else "n/a"
+
+
+# Substrings AnythingLLM uses when the *generation* provider is the thing that failed.
+# Deliberately narrow: misclassifying a retrieval failure as a provider failure would send
+# someone off fixing the wrong half of the stack.
+_PROVIDER_ERROR_MARKERS = (
+    "connection error",
+    "econnrefused",
+    "enotfound",
+    "etimedout",
+    "fetch failed",
+    "socket hang up",
+    "could not respond",
+    "does not exist",
+    "model not found",
+    "invalid api key",
+)
+
+
+def _looks_like_provider_error(error: str) -> bool:
+    lowered = str(error).lower()
+    return any(marker in lowered for marker in _PROVIDER_ERROR_MARKERS)
+
+
+def cmd_search(client: Client, args) -> int:
+    """Retrieval on its own, with no LLM involved.
+
+    `query` cannot distinguish "retrieval found nothing" from "the chat model is down":
+    when the provider is unreachable AnythingLLM answers `type: "abort"` with an empty
+    `sources` list, which looks exactly like a retrieval miss. This hits the vector store
+    directly, so embedding + similarity search can be confirmed on a host that has no LLM
+    at all — which is the normal state until the stacks are deployed next to the GPU
+    container.
+    """
+    cfg = client.cfg
+    body: dict = {"query": args.question, "topN": args.top_n}
+    if args.score_threshold is not None:
+        body["scoreThreshold"] = args.score_threshold
+
+    response = client.request(
+        "POST", f"workspace/{cfg.workspace_slug}/vector-search", timeout=180, json=body
+    )
+    if response.status_code == 404:
+        raise Fail(
+            f"POST workspace/{cfg.workspace_slug}/vector-search -> 404.\n"
+            "  Either the workspace slug is wrong (check `uv run scripts/allm.py auth`), or\n"
+            "  this AnythingLLM image predates the vector-search endpoint. In the latter\n"
+            "  case retrieval can only be confirmed through `query`, which needs the LLM."
+        )
+    if response.status_code >= 400:
+        raise Fail(f"vector-search -> HTTP {response.status_code}: {response.text[:500]}")
+    try:
+        payload = response.json() or {}
+    except ValueError as exc:
+        raise Fail(f"vector-search returned non-JSON: {response.text[:300]}") from exc
+
+    results = payload.get("results") or []
+    print(f"query:     {args.question}")
+    print(f"workspace: {cfg.workspace_slug}")
+    print(f"matches:   {len(results)}\n")
+    for index, hit in enumerate(results, 1):
+        metadata = hit.get("metadata") or {}
+        print(f"{index}. score={_score_text(hit.get('score'))}  "
+              f"distance={_score_text(hit.get('distance'))}")
+        print(f"   title:     {metadata.get('title') or '?'}")
+        print(f"   docSource: {metadata.get('docSource') or metadata.get('source') or '?'}")
+        snippet = " ".join((hit.get("text") or metadata.get("text") or "").split())[:200]
+        if snippet:
+            print(f"   text:      {snippet}...")
+
+    if not results:
+        print("No matches. Either `ingest` never ran for this workspace, or every chunk")
+        print("scored below the threshold — re-run with --score-threshold 0.0 to see the")
+        print("raw ranking before deciding which.")
+        return 1
+
+    print("\nRetrieval works: the documents are embedded in LanceDB and the query vector")
+    print("matched them. No LLM was involved in this check.")
+    return 0
+
+
 def cmd_query(client: Client, args) -> int:
     cfg = client.cfg
-    payload = client.json(
+    # Not client.json(): AnythingLLM returns HTTP 500 with a *useful* JSON body when
+    # generation fails, and that body is the only way to tell which half broke.
+    response = client.request(
         "POST",
         f"workspace/{cfg.workspace_slug}/chat",
         timeout=600,
         json={"message": args.question, "mode": args.mode},
     )
-    if payload.get("error"):
-        raise Fail(f"chat returned an error: {payload['error']}")
+    try:
+        payload = response.json() or {}
+    except ValueError:
+        payload = {}
+    if not payload and response.status_code >= 400:
+        raise Fail(f"chat -> HTTP {response.status_code}: {response.text[:500]}")
+
+    error = payload.get("error")
+    if error:
+        if _looks_like_provider_error(error):
+            base_path = os.environ.get("LLM_BASE_PATH", "<LLM_BASE_PATH unset>")
+            raise Fail(
+                f"the chat model could not be reached, so nothing was generated: {error}\n"
+                "  This says nothing about retrieval. AnythingLLM aborts before it fills in\n"
+                "  `sources`, so its empty `sources: []` is not evidence either way here.\n"
+                "  Confirm retrieval without the LLM:\n"
+                f"    uv run scripts/allm.py search {args.question!r}\n"
+                f"  Then fix generation — LLM_BASE_PATH is {base_path}:\n"
+                "    docker exec anythingllm curl -s $LLM_BASE_PATH/models"
+            )
+        raise Fail(f"chat returned an error: {error}")
 
     print("=" * 72)
     print(payload.get("textResponse", "<no textResponse field>").strip())
@@ -459,9 +564,7 @@ def cmd_query(client: Client, args) -> int:
     sources = payload.get("sources") or []
     print(f"\nsources: {len(sources)}")
     for source in sources:
-        score = source.get("score")
-        score_text = f"{score:.4f}" if isinstance(score, (int, float)) else "n/a"
-        print(f"  - {source.get('title', '?')}  score={score_text}")
+        print(f"  - {source.get('title', '?')}  score={_score_text(source.get('score'))}")
         print(f"    docSource: {source.get('docSource', '?')}")
         snippet = " ".join((source.get("text") or "").split())[:160]
         if snippet:
@@ -596,7 +699,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="ingest ledger location",
     )
 
-    query = sub.add_parser("query", help="ask the workspace a question")
+    search = sub.add_parser(
+        "search",
+        help="retrieval only, no LLM — confirms embeddings and vector search in isolation",
+    )
+    search.add_argument("question")
+    search.add_argument("--top-n", type=int, default=6)
+    search.add_argument(
+        "--score-threshold",
+        type=float,
+        default=None,
+        help="override the workspace's similarityThreshold; use 0.0 to see the raw ranking",
+    )
+
+    query = sub.add_parser("query", help="ask the workspace a question (needs the LLM)")
     query.add_argument("question")
     query.add_argument("--mode", choices=("query", "chat"), default="query")
 
@@ -633,6 +749,7 @@ def main(argv: list[str]) -> int:
         "auth": cmd_auth,
         "bootstrap": cmd_bootstrap,
         "ingest": cmd_ingest,
+        "search": cmd_search,
         "query": cmd_query,
         "docs": cmd_docs,
         "matrix": cmd_matrix,

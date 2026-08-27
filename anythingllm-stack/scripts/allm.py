@@ -218,6 +218,42 @@ class IngestLedger:
 # --------------------------------------------------------------------------- commands
 
 
+def cmd_set_key(env_path: Path, raw_key: str) -> None:
+    """Write ANYTHINGLLM_API_KEY into the dotenv file, in place.
+
+    Exists so the key never has to be pasted into a hand-written sed or editor command,
+    which is where this step usually goes wrong. Runs before Config.load(), because the
+    whole point is that there is no usable key yet.
+    """
+    key = raw_key.strip()
+    # People paste the key with the surrounding quotes from the UI more often than not.
+    if len(key) >= 2 and key[0] == key[-1] and key[0] in {'"', "'"}:
+        key = key[1:-1].strip()
+    if not key:
+        raise Fail("the key is empty")
+    if any(character.isspace() for character in key):
+        raise Fail(
+            "the key contains a space or newline, so it was not copied cleanly. "
+            "Copy it again from Settings > Tools > Developer API."
+        )
+    if not env_path.is_file():
+        raise Fail(f"{env_path} does not exist — run `bash scripts/setup.sh` first")
+
+    out: list[str] = []
+    replaced = False
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.lstrip()
+        if not stripped.startswith("#") and line.partition("=")[0].strip() == "ANYTHINGLLM_API_KEY":
+            out.append(f"ANYTHINGLLM_API_KEY={key}")
+            replaced = True
+        else:
+            out.append(line)
+    if not replaced:
+        out.append(f"ANYTHINGLLM_API_KEY={key}")
+    env_path.write_text("\n".join(out) + "\n", encoding="utf-8")
+    print(f"wrote ANYTHINGLLM_API_KEY ({len(key)} chars) to {env_path}")
+
+
 def cmd_auth(client: Client, _args) -> int:
     payload = client.json("GET", "auth")
     print(f"API key valid: {payload}")
@@ -531,6 +567,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("auth", help="validate the API key and show reachable endpoints")
 
+    set_key = sub.add_parser(
+        "set-key", help="write the Developer API key into .env, then validate it"
+    )
+    set_key.add_argument("key", help="the key from Settings > Tools > Developer API")
+
     bootstrap = sub.add_parser("bootstrap", help="create the workspace and set retrieval defaults")
     bootstrap.add_argument("--top-n", type=int, default=6, help="chunks retrieved per query")
     bootstrap.add_argument("--similarity-threshold", type=float, default=0.25)
@@ -570,7 +611,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str]) -> int:
     args = build_parser().parse_args(argv)
-    load_env_file(Path(args.env_file))
+    env_path = Path(args.env_file)
+
+    if args.command == "set-key":
+        cmd_set_key(env_path, args.key)
+        # Validate immediately: a bad paste should surface here, not three steps later.
+        os.environ.pop("ANYTHINGLLM_API_KEY", None)
+        load_env_file(env_path)
+        try:
+            return cmd_auth(Client(Config.load()), args)
+        except Fail as error:
+            print(f"key written, but it could not be validated: {error}", file=sys.stderr)
+            print("Is the container up? curl -s http://localhost:3001/api/ping", file=sys.stderr)
+            return 1
+
+    load_env_file(env_path)
     cfg = Config.load()
     client = Client(cfg)
 

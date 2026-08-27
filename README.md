@@ -54,11 +54,21 @@ scripts/verify.sh              the verification checklist, automated
 Everything below runs on the Docker host (Ubuntu guest under WSL2). Python tooling uses
 `uv` only — no `pip`, no virtualenv to create.
 
+> **Shortcut:** steps 1–5 below are also scripted. From the repo root,
+> `bash scripts/setup.sh` creates the network, the vault folder, both `.env` files, the
+> three secrets and the runtime folders, and auto-detects the local LLM's model id. It is
+> idempotent and never overwrites an existing `.env` or rotates a live secret. Read on for
+> what each of those values means and how to change it.
+
 **1. Put the stacks in place.** The compose files expect the layout `~/<stack>/`:
 
 ```bash
 cp -r unstructured-stack anythingllm-stack scripts ~/
 ```
+
+This is a convention, not a requirement — the compose files use only relative paths, and
+`scripts/verify.sh` locates the stacks relative to itself. Running both stacks straight
+from a clone works identically; the rest of this README says `~/<stack>` for brevity.
 
 **2. Create the shared external network** (skip if it already exists):
 
@@ -80,9 +90,9 @@ cd ~/unstructured-stack && cp .env.example .env && nano .env
 cd ~/anythingllm-stack  && cp .env.example .env && nano .env
 ```
 
-(Use whichever editor you have — `nano`, `vim`, or the file browser in your IDE. New to
-this? Follow [SETUP.md](SETUP.md) instead, which fills these in with copy-paste commands
-and no manual editing.)
+(Use whichever editor you have — `nano`, `vim`, or the file browser in your IDE. Or skip
+the editing entirely: `bash scripts/setup.sh` fills in everything in this section except
+the LLM model id, which it detects, and the API key from §5, which needs the UI.)
 
 The only values you *must* change from the defaults:
 
@@ -253,9 +263,13 @@ docker exec anythingllm curl -s http://host.docker.internal:8000/v1/models
 
 **Get a Developer API key.** Open `http://localhost:3001`, complete onboarding (choose the
 already-configured provider when prompted), then
-**Settings → Tools → Developer API → Generate New API Key**. Paste it into
-`anythingllm-stack/.env` as `ANYTHINGLLM_API_KEY`. This is the one value that cannot be
-pre-seeded from the environment.
+**Settings → Tools → Developer API → Generate New API Key**. This is the one value that
+cannot be pre-seeded from the environment. Write it into `anythingllm-stack/.env` and
+validate it in a single step:
+
+```bash
+uv run scripts/allm.py set-key <the-key-you-just-generated>
+```
 
 Then, from `~/anythingllm-stack`:
 

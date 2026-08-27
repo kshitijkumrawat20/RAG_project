@@ -12,9 +12,10 @@
 #   2. creates <vault>/corporate                    (skips if it exists)
 #   3. copies .env.example -> .env in both stacks   (skips if .env exists)
 #   4. fills in the vault paths and the uid/gid the preprocessor runs as
-#   5. generates JWT_SECRET / SIG_KEY / SIG_SALT    (skips any already set)
-#   6. creates the runtime folders both stacks need
-#   7. detects the local LLM on port 8000 and fills in its model id, if it is running
+#   5. clamps the cpu/memory limits to what this host actually has
+#   6. generates JWT_SECRET / SIG_KEY / SIG_SALT    (skips any already set)
+#   7. creates the runtime folders both stacks need
+#   8. detects the local LLM on port 8000 and fills in its model id, if it is running
 #
 # It does NOT start any container — Steps 2 and 4 of SETUP.md do that.
 
@@ -33,7 +34,9 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --vault)   VAULT="${2:?--vault needs a path}"; shift 2 ;;
     --network) NETWORK="${2:?--network needs a name}"; shift 2 ;;
-    -h|--help) sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    # Print the header comment block, so --help cannot drift out of sync with it.
+    -h|--help) awk 'NR>1 && /^#/ { sub(/^# ?/, ""); print; next } NR>1 { exit }' \
+                 "${BASH_SOURCE[0]}"; exit 0 ;;
     *)         printf 'unknown option: %s\n' "$1" >&2; exit 2 ;;
   esac
 done
@@ -161,7 +164,66 @@ set_kv "$UNS/.env" PREPROCESSOR_UID "$(id -u)"
 set_kv "$UNS/.env" PREPROCESSOR_GID "$(id -g)"
 ok "unstructured-stack/.env: preprocessor runs as $(id -u):$(id -g) (you)"
 
-# --- 5. secrets ----------------------------------------------------------------------
+# --- 5. resource limits --------------------------------------------------------------
+# Docker refuses to create a container whose `cpus` limit exceeds the host's core count:
+#   "range of CPUs is from 0.01 to 4.00, as there are only 4 CPUs available"
+# The committed defaults are sized for the target workstation, so only ever clamp DOWN.
+# Never raise a deliberately modest limit just because this host happens to be bigger —
+# the whole point of those numbers is to leave the GPU LLM container room to breathe.
+step "Resource limits"
+CPUS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 0)"
+TOTAL_GB=0
+mem_kb="$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null)"
+[[ "${mem_kb:-}" =~ ^[0-9]+$ ]] && TOTAL_GB=$(( mem_kb / 1048576 ))
+
+clamp_cpu() {
+  local file="$1" key="$2" cap="$3" current
+  current="$(get_kv "$file" "$key")" || return 0
+  [[ "$current" =~ ^[0-9]+(\.[0-9]+)?$ ]] || return 0
+  if awk -v c="$current" -v cap="$cap" 'BEGIN { exit !(c > cap) }'; then
+    set_kv "$file" "$key" "$cap"
+    ok "$key: $current -> $cap (host has $CPUS core(s))"
+  else
+    skip "$key=$current fits in $CPUS core(s)"
+  fi
+}
+
+clamp_mem() {
+  local file="$1" key="$2" cap="$3" current
+  current="$(get_kv "$file" "$key")" || return 0
+  if [[ ! "$current" =~ ^([0-9]+)[gG]$ ]]; then
+    skip "$key=$current is not a plain gigabyte value — left alone"
+    return 0
+  fi
+  if (( BASH_REMATCH[1] > cap )); then
+    set_kv "$file" "$key" "${cap}g"
+    ok "$key: $current -> ${cap}g (host has ${TOTAL_GB}g RAM)"
+  else
+    skip "$key=$current fits in ${TOTAL_GB}g RAM"
+  fi
+}
+
+if [[ ! "$CPUS" =~ ^[0-9]+$ ]] || (( CPUS < 1 )); then
+  warn "could not determine the CPU count — leaving the cpus limits alone"
+else
+  # Leave one core for the host and, on the real deployment, for the LLM container.
+  cpu_cap=$(( CPUS > 1 ? CPUS - 1 : 1 ))
+  clamp_cpu "$UNS/.env"  UNSTRUCTURED_API_CPU_LIMIT "$cpu_cap"
+  clamp_cpu "$UNS/.env"  PREPROCESSOR_CPU_LIMIT     "$cpu_cap"
+  clamp_cpu "$ALLM/.env" ANYTHINGLLM_CPU_LIMIT      "$cpu_cap"
+fi
+
+if (( TOTAL_GB < 1 )); then
+  warn "could not determine total RAM — leaving the memory limits alone"
+else
+  # A limit is a ceiling, not a reservation, so half of RAM each is not overcommitting.
+  mem_cap=$(( TOTAL_GB / 2 )); (( mem_cap < 1 )) && mem_cap=1
+  clamp_mem "$UNS/.env"  UNSTRUCTURED_API_MEM_LIMIT "$mem_cap"
+  clamp_mem "$UNS/.env"  PREPROCESSOR_MEM_LIMIT     "$mem_cap"
+  clamp_mem "$ALLM/.env" ANYTHINGLLM_MEM_LIMIT      "$mem_cap"
+fi
+
+# --- 6. secrets ----------------------------------------------------------------------
 step "Secrets"
 for v in JWT_SECRET SIG_KEY SIG_SALT; do
   current="$(get_kv "$ALLM/.env" "$v")"
@@ -172,7 +234,7 @@ for v in JWT_SECRET SIG_KEY SIG_SALT; do
   fi
 done
 
-# --- 6. runtime folders --------------------------------------------------------------
+# --- 7. runtime folders --------------------------------------------------------------
 step "Runtime folders"
 mkdir -p "$UNS"/data/{inbox,archive,failed,state} && ok "unstructured-stack/data/{inbox,archive,failed,state}"
 mkdir -p "$ALLM/data" && ok "anythingllm-stack/data"
@@ -184,7 +246,7 @@ else
   : > "$ALLM/data/.env" && ok "anythingllm-stack/data/.env (must be a file, not a folder)"
 fi
 
-# --- 7. local LLM --------------------------------------------------------------------
+# --- 8. local LLM --------------------------------------------------------------------
 step "Local LLM on port 8000"
 models_json="$(curl -fsS --max-time 5 http://localhost:8000/v1/models 2>/dev/null)"
 model_id="$(printf '%s' "$models_json" \

@@ -270,6 +270,7 @@ will find the LLM and fill in the model id automatically.
 | `command not found: .env` | `$EDITOR` isn't set. Use `nano .env`, or let `setup.sh` do the editing. |
 | `sed: -e expression #1: unknown option to 's'` | Mismatched delimiters — `s\|…\|…\|` needs the same character all three times. Again: use `setup.sh`. |
 | `network ai-stack-net not found` | `setup.sh` couldn't reach Docker. Check `docker ps`, then re-run it. |
+| `range of CPUs is from 0.01 to 4.00, as there are only 4 CPUs available` | A `cpus` limit is higher than this host's core count. Re-run `setup.sh` — it clamps them. |
 | `set JWT_SECRET in .env` | Secrets missing. Re-run `setup.sh`. |
 | Preprocessor restart-loops with a permission error | It isn't running as you. Re-run `setup.sh`, then `docker compose up -d` again. |
 | Provider settings revert after a restart | Normal and deliberate — `.env` wins over the UI. Change `.env`. |

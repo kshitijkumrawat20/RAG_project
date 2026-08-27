@@ -94,10 +94,29 @@ printf 'repo:    %s\nvault:   %s\n' "$REPO_ROOT" "$VAULT"
 # Done before the network step so that .env can supply SHARED_NETWORK_NAME.
 step "Config files"
 for d in "$UNS" "$ALLM"; do
+  [[ -f "$d/.env.example" ]] || die "$d/.env.example is missing"
   if [[ -f "$d/.env" ]]; then
     skip "$(basename "$d")/.env already exists — leaving it alone"
+    # But an .env carried over from an older version of the example can be missing keys
+    # entirely. Compose expands an undefined ${VAR} to the empty string with only a
+    # warning, so a missing LLM_BASE_PATH shows up as a mystery connection failure much
+    # later. Backfill anything absent, using the example's own default.
+    added=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line="${line%$'\r'}"
+      [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+      [[ "$line" == *=* ]] || continue
+      example_key="${line%%=*}"
+      example_key="${example_key//[[:space:]]/}"
+      [[ "$example_key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+      if ! get_kv "$d/.env" "$example_key" >/dev/null; then
+        set_kv "$d/.env" "$example_key" "${line#*=}"
+        printf '    + added missing %s\n' "$example_key"
+        added=$((added + 1))
+      fi
+    done < "$d/.env.example"
+    (( added )) && warn "$(basename "$d")/.env was missing $added key(s) — backfilled from .env.example"
   else
-    [[ -f "$d/.env.example" ]] || die "$d/.env.example is missing"
     cp "$d/.env.example" "$d/.env" || die "could not create $d/.env"
     ok "created $(basename "$d")/.env"
   fi

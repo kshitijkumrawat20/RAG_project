@@ -1,0 +1,24 @@
+# Both stacks run on Linux. Pin LF so it stays that way no matter which OS commits, and
+# regardless of the committer's core.autocrlf setting.
+#
+# This is prevention, not a fix for an existing problem — the tree is already all-LF. But a
+# CRLF file reaching the Linux host fails in ways that are genuinely hard to read:
+#   *.sh   -> bash sees `set -uo pipefail\r`, and every string comparison carries a stray \r
+#   *.env* -> Compose reads the \r into the value, so ${VAULT_HOST_PATH} becomes a mount
+#             path ending in a carriage return and the container refuses to start
+#   *.py   -> shebang lines and PEP 723 inline metadata blocks stop being recognised
+* text=auto eol=lf
+
+# Test fixtures are real documents — never transform them.
+*.pdf  binary
+*.doc  binary
+*.docx binary
+*.xls  binary
+*.xlsx binary
+*.ppt  binary
+*.pptx binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.zip  binary
